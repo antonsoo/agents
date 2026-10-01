@@ -13,6 +13,8 @@ from ..voice.remote_session import TcpSessionTransport
 
 WIRE_SAMPLE_RATE = 48000
 AGENT_SAMPLE_RATE = 24000
+_BYTES_PER_SAMPLE = 2  # mono, 16-bit
+_RESEND_CHUNK_BYTES = WIRE_SAMPLE_RATE // 50 * _BYTES_PER_SAMPLE  # 20 ms
 
 _SENTINEL = object()
 
@@ -89,6 +91,15 @@ class TcpAudioOutput(io.AudioOutput):
         self._interrupted_ev = asyncio.Event()
         self._agent_loop: asyncio.AbstractEventLoop | None = None
 
+        # The client plays whatever it has been sent and the protocol has no pause, so a
+        # pause takes back the audio it has not played yet (a clear) and a resume sends
+        # that part again. For that the current segment is kept here as it went out.
+        self._segment_pcm = bytearray()
+        self._resume_pos = 0  # bytes of _segment_pcm played when the pause began
+        self._flush_requested = False
+        self._paused_at: float | None = None
+        self._paused_duration: float = 0.0
+
     async def capture_frame(self, frame: rtc.AudioFrame) -> None:
         await super().capture_frame(frame)
 
@@ -101,27 +112,29 @@ class TcpAudioOutput(io.AudioOutput):
 
         if not self._pushed_duration:
             self._capture_start = time.monotonic()
+            self._paused_duration = 0.0
+            self._resume_pos = 0
+            if self._paused_at is not None:
+                # a segment that starts during a pause has played nothing yet
+                self._paused_at = self._capture_start
             self.on_playback_started(created_at=time.time())
 
         self._pushed_duration += frame.duration
 
         resampled = self._resampler.push(frame)
         for rf in resampled:
-            audio_frame = agent_pb.AgentSessionMessage.ConsoleIO.AudioFrame(
-                data=bytes(rf.data),
-                sample_rate=WIRE_SAMPLE_RATE,
-                num_channels=rf.num_channels,
-                samples_per_channel=rf.samples_per_channel,
-            )
-            msg = agent_pb.AgentSessionMessage(audio_output=audio_frame)
-            self._transport.send_message_threadsafe(msg)
+            data = bytes(rf.data)
+            self._segment_pcm += data
+            if self._paused_at is None:
+                self._send_audio(data)
 
     def flush(self) -> None:
         super().flush()
-        msg = agent_pb.AgentSessionMessage(
-            audio_playback_flush=agent_pb.AgentSessionMessage.ConsoleIO.AudioPlaybackFlush()
-        )
-        self._transport.send_message_threadsafe(msg)
+        self._flush_requested = True
+        if self._paused_at is None:
+            # while paused the client has nothing buffered and would report the playout
+            # as finished at once; resume() sends the flush after the remaining audio
+            self._send_flush()
 
         if self._pushed_duration:
             if self._flush_task and not self._flush_task.done():
@@ -133,13 +146,70 @@ class TcpAudioOutput(io.AudioOutput):
             self._flush_task = asyncio.create_task(self._wait_for_playout())
 
     def clear_buffer(self) -> None:
+        self._send_clear()
+
+        if self._pushed_duration:
+            self._interrupted_ev.set()
+
+    def pause(self) -> None:
+        super().pause()
+
+        if self._paused_at is not None:
+            return
+
+        self._paused_at = time.monotonic()
+        if self._pushed_duration:
+            played = int(self._played_duration() * WIRE_SAMPLE_RATE) * _BYTES_PER_SAMPLE
+            self._resume_pos = min(played, len(self._segment_pcm))
+            self._send_clear()
+
+    def resume(self) -> None:
+        super().resume()
+
+        if self._paused_at is None:
+            return
+
+        paused_at, self._paused_at = self._paused_at, None
+        if not self._pushed_duration:
+            return
+
+        self._paused_duration += time.monotonic() - paused_at
+        remaining = memoryview(self._segment_pcm)[self._resume_pos :]
+        for i in range(0, len(remaining), _RESEND_CHUNK_BYTES):
+            self._send_audio(bytes(remaining[i : i + _RESEND_CHUNK_BYTES]))
+        if self._flush_requested:
+            self._send_flush()
+
+    def _played_duration(self) -> float:
+        """Seconds of the current segment the client has played, going by the clock."""
+        now = time.monotonic()
+        paused = self._paused_duration
+        if self._paused_at is not None:
+            paused += now - self._paused_at
+        return min(max(0.0, now - self._capture_start - paused), self._pushed_duration)
+
+    def _send_audio(self, data: bytes) -> None:
+        audio_frame = agent_pb.AgentSessionMessage.ConsoleIO.AudioFrame(
+            data=data,
+            sample_rate=WIRE_SAMPLE_RATE,
+            num_channels=1,
+            samples_per_channel=len(data) // _BYTES_PER_SAMPLE,
+        )
+        self._transport.send_message_threadsafe(
+            agent_pb.AgentSessionMessage(audio_output=audio_frame)
+        )
+
+    def _send_flush(self) -> None:
+        msg = agent_pb.AgentSessionMessage(
+            audio_playback_flush=agent_pb.AgentSessionMessage.ConsoleIO.AudioPlaybackFlush()
+        )
+        self._transport.send_message_threadsafe(msg)
+
+    def _send_clear(self) -> None:
         msg = agent_pb.AgentSessionMessage(
             audio_playback_clear=agent_pb.AgentSessionMessage.ConsoleIO.AudioPlaybackClear()
         )
         self._transport.send_message_threadsafe(msg)
-
-        if self._pushed_duration:
-            self._interrupted_ev.set()
 
     def notify_playout_finished(self) -> None:
         if self._agent_loop is not None:
@@ -160,13 +230,14 @@ class TcpAudioOutput(io.AudioOutput):
             wait_done.cancel()
             wait_interrupt.cancel()
 
-        if interrupted:
-            played = time.monotonic() - self._capture_start
-            played = min(max(0, played), self._pushed_duration)
-        else:
-            played = self._pushed_duration
+        played = self._played_duration() if interrupted else self._pushed_duration
 
         self.on_playback_finished(playback_position=played, interrupted=interrupted)
 
         self._pushed_duration = 0.0
         self._interrupted_ev.clear()
+        self._segment_pcm.clear()
+        self._resume_pos = 0
+        self._flush_requested = False
+        self._paused_at = None
+        self._paused_duration = 0.0
