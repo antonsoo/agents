@@ -114,6 +114,7 @@ class TcpAudioOutput(io.AudioOutput):
             self._capture_start = time.monotonic()
             self._paused_duration = 0.0
             self._resume_pos = 0
+            self._flush_requested = False
             if self._paused_at is not None:
                 # a segment that starts during a pause has played nothing yet
                 self._paused_at = self._capture_start
@@ -124,6 +125,8 @@ class TcpAudioOutput(io.AudioOutput):
         resampled = self._resampler.push(frame)
         for rf in resampled:
             data = bytes(rf.data)
+            if self._paused_at is None:
+                self._exclude_underrun()
             self._segment_pcm += data
             if self._paused_at is None:
                 self._send_audio(data)
@@ -157,6 +160,7 @@ class TcpAudioOutput(io.AudioOutput):
         if self._paused_at is not None:
             return
 
+        self._exclude_underrun()
         self._paused_at = time.monotonic()
         if self._pushed_duration:
             played = int(self._played_duration() * WIRE_SAMPLE_RATE) * _BYTES_PER_SAMPLE
@@ -166,7 +170,7 @@ class TcpAudioOutput(io.AudioOutput):
     def resume(self) -> None:
         super().resume()
 
-        if self._paused_at is None:
+        if self._paused_at is None or self._interrupted_ev.is_set():
             return
 
         paused_at, self._paused_at = self._paused_at, None
@@ -186,7 +190,15 @@ class TcpAudioOutput(io.AudioOutput):
         paused = self._paused_duration
         if self._paused_at is not None:
             paused += now - self._paused_at
-        return min(max(0.0, now - self._capture_start - paused), self._pushed_duration)
+        sent_duration = len(self._segment_pcm) / (WIRE_SAMPLE_RATE * _BYTES_PER_SAMPLE)
+        return min(max(0.0, now - self._capture_start - paused), sent_duration)
+
+    def _exclude_underrun(self) -> None:
+        """Exclude silence after the client exhausts the audio sent so far."""
+        sent_duration = len(self._segment_pcm) / (WIRE_SAMPLE_RATE * _BYTES_PER_SAMPLE)
+        self._capture_start = max(
+            self._capture_start, time.monotonic() - self._paused_duration - sent_duration
+        )
 
     def _send_audio(self, data: bytes) -> None:
         audio_frame = agent_pb.AgentSessionMessage.ConsoleIO.AudioFrame(

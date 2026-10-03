@@ -176,3 +176,82 @@ async def test_playout_without_a_pause_is_unchanged(clock: _Clock) -> None:
     before = len(client.messages)
     out.resume()
     assert len(client.messages) == before
+
+
+async def test_pause_after_audio_underrun_preserves_the_newly_buffered_audio(clock: _Clock) -> None:
+    client = _Client()
+    out = TcpAudioOutput(client)  # type: ignore[arg-type]
+
+    await _capture(out, 0.1)
+    first_audio = client.audio()
+    clock.now += 2.0  # the client drains its buffer while the provider is stalled
+    await _capture(out, 1.0)
+    sent = client.audio()
+    clock.now += 0.25
+    out.pause()
+    held_from = len(client.messages)
+    clock.now += 3.0
+    out.resume()
+
+    # The two seconds of silence are not samples the client played. It consumed
+    # the first burst and 250 ms of the second, so the remainder must be replayed.
+    expected = sent[len(first_audio) + _played_bytes(0.25) :]
+    assert expected
+    replayed = client.audio(held_from)
+    # Rounding the estimated position down can replay one extra 48 kHz sample.
+    assert len(replayed) - len(expected) in (0, 2)
+    assert replayed[-len(expected) :] == expected
+
+
+async def test_audio_arriving_while_paused_after_underrun_starts_at_resume(clock: _Clock) -> None:
+    client = _Client()
+    out = TcpAudioOutput(client)  # type: ignore[arg-type]
+
+    await _capture(out, 0.1)
+    clock.now += 2.0
+    out.pause()  # everything sent so far has already played
+    await _capture(out, 1.0)
+    held_from = len(client.messages)
+    clock.now += 3.0
+    out.resume()
+    resumed_audio = client.audio(held_from)
+    assert resumed_audio
+
+    clock.now += 0.25
+    out.pause()
+    held_from = len(client.messages)
+    clock.now += 2.0
+    out.resume()
+    assert client.audio(held_from) == resumed_audio[_played_bytes(0.25) :]
+
+
+async def test_empty_flush_does_not_flush_the_next_segment_on_resume(clock: _Clock) -> None:
+    client = _Client()
+    out = TcpAudioOutput(client)  # type: ignore[arg-type]
+    out.flush()
+    await _capture(out, 1.0)
+    clock.now += 0.25
+    out.pause()
+    held_from = len(client.messages)
+    out.resume()
+    assert set(client.kinds()[held_from:]) == {"audio_output"}
+
+
+async def test_resume_after_clear_does_not_resend_the_interrupted_segment(clock: _Clock) -> None:
+    client = _Client()
+    out = TcpAudioOutput(client)  # type: ignore[arg-type]
+    finished: list[PlaybackFinishedEvent] = []
+    out.on("playback_finished", finished.append)
+    await _capture(out, 1.0)
+    out.flush()
+    clock.now += 0.25
+    out.pause()
+    clock.now += 2.0
+    out.clear_buffer()
+    cleared_from = len(client.messages)
+    out.resume()
+    await asyncio.sleep(0.01)
+    assert client.messages[cleared_from:] == []
+    assert len(finished) == 1
+    assert finished[0].interrupted
+    assert finished[0].playback_position == pytest.approx(0.25)
