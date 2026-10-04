@@ -2858,6 +2858,7 @@ class AgentActivity(RecognitionHooks):
                 and preemptive.chat_ctx.is_equivalent(temp_mutable_chat_ctx)
                 and preemptive.tools == self.tools
                 and preemptive.tool_choice == self._tool_choice
+                and preemptive.speech_handle._error is None
             ):
                 speech_handle = preemptive.speech_handle
 
@@ -2875,7 +2876,8 @@ class AgentActivity(RecognitionHooks):
             else:
                 logger.warning(
                     "preemptive generation invalidated after `on_user_turn_completed` because "
-                    "the transcript, chat context, tools, or tool choice changed",
+                    "the transcript, chat context, tools, or tool choice changed, "
+                    "or the generation failed",
                 )
                 discarded_preemptive = preemptive.speech_handle
                 preemptive.speech_handle._cancel()
