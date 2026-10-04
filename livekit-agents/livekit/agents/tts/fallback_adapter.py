@@ -232,7 +232,7 @@ class FallbackChunkedStream(ChunkedStream):
         self, *, tts: TTS, recovering: bool = False
     ) -> AsyncGenerator[SynthesizedAudio, None]:
         try:
-            async with tts.synthesize(
+            stream = tts.synthesize(
                 self._input_text,
                 conn_options=dataclasses.replace(
                     self._conn_options,
@@ -240,7 +240,10 @@ class FallbackChunkedStream(ChunkedStream):
                     timeout=self._conn_options.timeout,
                     retry_interval=self._conn_options.retry_interval,
                 ),
-            ) as stream:
+            )
+            if not recovering:
+                stream._retry_on_partial_audio = self._retry_on_partial_audio
+            async with stream:
                 should_set_active = not recovering
                 async for audio in stream:
                     if should_set_active:

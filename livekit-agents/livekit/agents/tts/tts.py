@@ -282,6 +282,9 @@ class ChunkedStream(ABC):
         self._input_text = input_text
         self._tts = tts
         self._conn_options = conn_options
+        # Buffered consumers can discard partial audio when the request_id changes.
+        # StreamAdapter disables this once audio is forwarded for live playback.
+        self._retry_on_partial_audio = True
         # the full text is submitted to the provider at creation time
         self._started_time: float = time.perf_counter()
         self._event_ch = aio.Chan[SynthesizedAudio]()
@@ -416,6 +419,7 @@ class ChunkedStream(ABC):
                     e.retryable
                     and self._conn_options.max_retry > 0
                     and i < self._conn_options.max_retry
+                    and (self._retry_on_partial_audio or output_emitter.pushed_duration() == 0.0)
                 )
 
                 if not should_retry:

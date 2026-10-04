@@ -179,9 +179,13 @@ class StreamAdapterWrapper(SynthesizeStream):
                         continue
 
                 self._mark_started()
-                async with self._tts._wrapped_tts.synthesize(
+                tts_stream = self._tts._wrapped_tts.synthesize(
                     text, conn_options=self._wrapped_tts_conn_options
-                ) as tts_stream:
+                )
+                # Audio is forwarded immediately and cannot be discarded on a retry.
+                # Keep retries before audio, as with a native SynthesizeStream.
+                tts_stream._retry_on_partial_audio = False
+                async with tts_stream:
                     async for audio in tts_stream:
                         output_emitter.push_frame(audio.frame)
                         duration += audio.frame.duration
