@@ -367,9 +367,13 @@ class ChunkedStream(ABC):
         self._tts.emit("metrics_collected", metrics)
 
     async def collect(self) -> rtc.AudioFrame:
-        """Utility method to collect every frame in a single call"""
-        frames = []
+        """Collect the final synthesis attempt's frames in a single call."""
+        frames: list[rtc.AudioFrame] = []
+        request_id: str | None = None
         async for ev in self:
+            if ev.request_id != request_id:
+                frames.clear()
+                request_id = ev.request_id
             frames.append(ev.frame)
 
         return rtc.combine_audio_frames(frames)
@@ -887,7 +891,7 @@ class AudioEmitter:
 
         if not request_id:
             logger.warning("no request_id provided for TTS %s", self._label)
-            request_id = "unknown"
+            request_id = shortuuid()
 
         self._started = True
         self._request_id = request_id
