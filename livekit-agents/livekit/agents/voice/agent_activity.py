@@ -973,7 +973,13 @@ class AgentActivity(RecognitionHooks):
 
             def _mark_done_if_needed(_: asyncio.Task) -> None:
                 if all(task.done() for task in speech_handle._tasks):
-                    speech_handle._mark_done()
+                    error = speech_handle._error
+                    for task in speech_handle._tasks:
+                        if not task.cancelled():
+                            task_error = task.exception()
+                            if error is None:
+                                error = task_error
+                    speech_handle._mark_done(error=error)
 
             task.add_done_callback(_mark_done_if_needed)
 
@@ -3273,6 +3279,16 @@ class AgentActivity(RecognitionHooks):
         for task in (tts_task, forward_audio_task, forward_text_task):
             if task is not None and task.done() and not task.cancelled():
                 if exc := task.exception():
+                    if (
+                        audio_output is not None
+                        and forward_audio_task is not None
+                        and forward_audio_task.done()
+                        and not forward_audio_task.cancelled()
+                        and forward_audio_task.exception() is None
+                    ):
+                        await speech_handle.wait_if_not_interrupted(
+                            [asyncio.ensure_future(audio_output.wait_for_playout())]
+                        )
                     raise exc
 
         if audio_output is not None:
